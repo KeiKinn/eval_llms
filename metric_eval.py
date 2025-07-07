@@ -15,6 +15,7 @@ Metrics implemented
 | **ROUGE-L**             | 0 – 1        | Longest common subsequence (recall-oriented)               |
 | **CIDEr**               | 0 – 10       | TF-IDF-weighted n-gram consensus (caption benchmark)       |
 | **CosineSim (Nomic)**   | -1 – 1       | Semantic similarity via *nomic-ai/nomic-embed-text-v1*     |
+| **BLEURT-20**           | ~0 – 1       | Neural adequacy + fluency (trained metric)                 |
 
 Deeper info:
 * **CIDEr** – consensus n-gram similarity, TF-IDF-weighted (0-10, higher⇑).
@@ -23,15 +24,20 @@ Deeper info:
 * **CosineSim (Nomic)** – average cosine similarity between reference and
   prediction embeddings from *nomic-ai/nomic-embed-text-v1* (-1→1, higher⇑).
   Captures overall semantic alignment.
+* **BLEURT-20** – a multilingual BERT-based regressor fine-tuned on hundreds-of-thousands of human adequacy ratings plus synthetic noise.  
+  Scores usually land between **0 and 1** (higher ⇑ is better).  A BERT/RemBERT model fine-tuned on human judgement data;
+  Unlike lexical metrics, BLEURT rewards any well-formed paraphrase that preserves the reference meaning, even if it re-phrases almost every word.
+- Download model: wget https://storage.googleapis.com/bleurt-oss-21/BLEURT-20.zip
+- Unzip it: unzip BLUERT-20 
 
 Quick start
 -----------
 bash
 python llm_eval.py                  # uses defaults: dummy_eval_data.csv, etc.
+(barplot_comparison.png) in the same folder.
 
 
 The script writes llm_evaluation_results.csv plus a bar plot
-(barplot_comparison.png) in the same folder.
 
 Dependencies auto-installed on first run:
 * pycocoevalcap  (for CIDEr)
@@ -67,11 +73,12 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Callable, List
-
+import torch
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+from bert_score import BERTScorer          # pip install bert-score
 
 import nltk  # NLTK downloads handled lazily further below
 
@@ -206,10 +213,12 @@ def evaluate(
     *,
     save_dir: os.PathLike | str = "./eval_out",
     save_figs: bool = True,
+    with_bleurt: bool = False,                # NEW
+    bleurt_ckpt: os.PathLike | str = "./BLEURT-20",  # NEW
 ):
     """Run automatic evaluation on *csv_path* (single reference vs ≥1 models)."""
 
-    _ensure_nltk()
+    # _ensure_nltk()
     csv_path = Path(csv_path)
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -224,6 +233,32 @@ def evaluate(
     if not pred_cols:
         raise ValueError("None of the specified prediction columns exist in the CSV.")
 
+    # --- BLEURT support --------------------------------------------------------
+    def _ensure_bleurt() -> None:
+        """Install the `bleurt` wheel if it is missing."""
+        if importlib.util.find_spec("bleurt") is None:
+            print("[i] Installing bleurt …")
+            _pip_install("bleurt==0.0.2")
+            print("[✓] bleurt installed")
+
+    def _ensure_bleurt_ckpt(ckpt_path: Path) -> Path:
+        """
+        Make sure *ckpt_path* exists.
+        If the directory/file is missing, pull the official BLEURT-20 checkpoint.
+        """
+        if ckpt_path.exists():
+            return ckpt_path
+
+        ckpt_url = (
+            "https://storage.googleapis.com/bleurt-20/BLEURT-20.tgz"
+        )  # 1.1 MB tarball
+        print(f"[i] Downloading BLEURT-20 checkpoint → {ckpt_path} …")
+        tmp_tgz = ckpt_path.with_suffix(".tgz")
+        subprocess.check_call(["curl", "-L", "-o", tmp_tgz, ckpt_url])
+        subprocess.check_call(["tar", "xzf", tmp_tgz, "-C", ckpt_path.parent])
+        tmp_tgz.unlink(missing_ok=True)
+        print("[✓] BLEURT-20 ready")
+        return ckpt_path
     # ---- metric definitions ---------------------------------------------
     bleu = _safe_load("bleu")
     meteor = _safe_load("meteor")
@@ -246,6 +281,48 @@ def evaluate(
         # ("SPICE", lambda p: _compute_spice(refs, p), 1.0, "Scene-graph semantics"),
         ("CosineSim(Nomic)", lambda p: _compute_cosine_nomic(refs, p), 1.0, "Embedding similarity"),
     ]
+        # -------- optional BLEURT-20 -----------------------------------------
+    if with_bleurt:
+        _ensure_bleurt()
+        from bleurt import score   # import only if really needed
+
+        ckpt = _ensure_bleurt_ckpt(Path(bleurt_ckpt))
+        _scorer = score.BleurtScorer(str(ckpt))  # load once, reuse!
+
+        metric_defs.append(
+            ("BLEURT-20",
+             lambda p, _s=_scorer: float(np.mean(_s.score(references=refs,
+                                                          candidates=p))),
+             1.0, "Neural semantic similarity")
+        )
+    # ---- BERTScore -----------------------------------------------------------
+    try:
+        from bert_score import BERTScorer
+    except ImportError:
+        _pip_install("bert-score")
+        from bert_score import BERTScorer
+
+    def _get_bertscorer():
+        """Instantiate once, reuse across models to save GPU / CPU time."""
+        # Auto-detect: English → 'bert-base-uncased', else multilingual
+        bert_lang = "en" if all(t.isascii() for t in refs[:50]) else "multilingual"
+        model_type = "microsoft/deberta-large-mnli" if bert_lang == "en" else "microsoft/mdeberta-v3-base"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        return BERTScorer(
+            lang=bert_lang,
+            model_type=model_type,
+            rescale_with_baseline=True,   # enables IDF re-scaling for fairer scores
+            device=device,
+        )
+
+    _bertscorer = _get_bertscorer()
+    metric_defs.append((
+        "BERTScore",
+        lambda p, _bs=_bertscorer: float(_bs.score(p, refs)[2].mean().item()),
+        1.0,
+        "Contextual embedding",
+    ))
+
 
     # ---- compute scores --------------------------------------------------
     rows = []
@@ -274,53 +351,90 @@ def evaluate(
 
 
 # ---------------------------------------------------------------------------
-# ---- 5. Plot utilities ---------------------------------------------------
+# ---- 5. Plot utilities  (replace the two functions only) ------------------
 # ---------------------------------------------------------------------------
 
+# ❶ Classify the metrics once so we can style them differently ---------------
+_LEXICAL = {
+    "BLEU-1", "BLEU-4", "METEOR", "ROUGE-L", "CIDEr",  # add SPICE if you turn it on
+}
+_EMBED   = {
+    "CosineSim(Nomic)", "BLEURT-20", "BERTScore",
+}
+
 dark_blue_palette = [
-    "#AEC6CF",  # pastel blue
-    "#FFB347",  # pastel orange
-    "#77DD77",  # pastel green
-    "#CBAACB",  # pastel purple
-    "#FFD1DC",  # pastel pink
-    "#FDFD96",  # pastel yellow
-    "#B0E0E6",  # pastel turquoise
-    "#D6AEDD",  # soft lilac
-    "#FFDAC1",  # light peach
-    "#E0BBE4",  # lavender blush
+    "#AEC6CF", "#FFB347", "#77DD77", "#CBAACB", "#FFD1DC",
+    "#FDFD96", "#B0E0E6", "#D6AEDD", "#FFDAC1", "#E0BBE4",
 ]
 
-
+# ------------------------------------------------------------------ BAR PLOT
 def _plot_bar(df: pd.DataFrame, model_cols: List[str], save_dir: Path):
-    melted = df.melt(id_vars=["Metric"], value_vars=model_cols, var_name="Model", value_name="Score")
+    """
+    Bar-plot with **stars** (hatch) for lexical metrics and plain bars for
+    embedding / neural metrics.
+    """
+    melted = df.melt(
+        id_vars=["Metric"],
+        value_vars=model_cols,
+        var_name="Model",
+        value_name="Score",
+    )
     melted["Score"] = pd.to_numeric(melted["Score"], errors="coerce")
 
-    plt.figure(figsize=(10, 6))
-    sns.barplot(data=melted, x="Metric", y="Score", hue="Model", errwidth=0, palette=dark_blue_palette)
+    # draw the bars ----------------------------------------------------------
+    g = sns.catplot(
+        data=melted,
+        x="Metric",
+        y="Score",
+        hue="Model",
+        kind="bar",
+        palette=dark_blue_palette[: len(model_cols)],
+        height=6,
+        aspect=1.6,
+        dodge=True,
+        errwidth=0,
+    )
+
+    # Add hatches (= little stripes) on the lexical bars only ----------------
+    ax = g.ax
+    # hatch = "*"
+    for i, this_bar in enumerate(ax.patches):
+        metric = melted.iloc[i // len(model_cols)]["Metric"]
+        # if metric in _LEXICAL:
+        #     this_bar.set_hatch(hatch)
+
     ymax = melted["Score"].max(skipna=True)
-    plt.ylim(0, 1.1 * ymax if (ymax is not None and ymax > 1) else 1.1)
-    plt.title("LLM Evaluation Metrics")
-    plt.xticks(rotation=45, ha="right")
-    plt.tight_layout()
+    ax.set_ylim(0, 1.1 * ymax if ymax and ymax > 1 else 1.1)
+    ax.set_title("LLM Evaluation Metrics")
+    ax.set_xlabel("")
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
+    g.tight_layout()
     outfile = save_dir / "barplot_comparison.png"
-    plt.savefig(outfile)
-    plt.close()
+    g.savefig(outfile)
+    plt.close(g.figure)
     print("[✓] Bar plot saved to", outfile)
 
 
+# ------------------------------------------------------------------ RADAR PLOT
 def _plot_radar(df: pd.DataFrame, two_models: List[str], save_dir: Path):
+    """
+    Radar plot: lexical points marked with ★, embedding points with ●.
+    """
     labels = df["Metric"].tolist()
     angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
-    angles += [angles[0]]
+    angles += angles[:1]  # close the loop
 
     fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
 
-    for col, marker, color in zip(two_models, ("o", "s"), dark_blue_palette):
-        vals = df[col].tolist() + [df[col].iloc[0]]
-        vals = [float(v) if str(v).replace(".", "", 1).lstrip("-").isdigit() else np.nan for v in vals]
-        ax.plot(angles, vals, marker=marker, label=col, color=color)
-        ax.fill(angles, vals, alpha=0.15, color=color)
+    colours = dark_blue_palette[: len(two_models)]
+    markers_for_metric = ["*" if m in _LEXICAL else "o" for m in labels]
 
+    for col, colour in zip(two_models, colours):
+        vals = df[col].astype(float).tolist() + [df[col].iloc[0]]
+        ax.plot(angles, vals, color=colour, linewidth=2, label=col)
+        # scatter points with per-metric marker style ------------------------
+        for ang, v, m in zip(angles, vals, markers_for_metric + [markers_for_metric[0]]):
+            ax.scatter([ang], [v], marker=m, color=colour, s=80, zorder=3)
 
     ax.set_thetagrids(np.degrees(angles[:-1]), labels)
     ax.set_ylim(0, np.nanmax(df[two_models].to_numpy(dtype=float)) * 1.1)
@@ -331,6 +445,7 @@ def _plot_radar(df: pd.DataFrame, two_models: List[str], save_dir: Path):
     plt.savefig(outfile)
     plt.close()
     print("[✓] Radar plot saved to", outfile)
+
 
 # ---------------------------------------------------------------------------
 # ---- 6. CLI --------------------------------------------------------------
@@ -343,6 +458,11 @@ def _parse_args():
     p.add_argument("--preds", nargs="+", default=["llm1_prediction", "llm2_prediction"], help="Prediction column(s)")
     p.add_argument("--no-figs", action="store_true", help="Skip plot generation")
     p.add_argument("--save-dir", default="./eval_out", help="Output directory for results & plots")
+    p.add_argument("--with-bleurt", action="store_true",
+                   help="Compute BLEURT-20 as well (installs bleurt if needed)")
+    p.add_argument("--bleurt-checkpoint", default="./BLEURT-20",
+                   help="Folder or model file for BLEURT-20")
+
     return p.parse_args()
 
 
@@ -354,4 +474,6 @@ if __name__ == "__main__":
         pred_cols=args.preds,
         save_dir=args.save_dir,
         save_figs=not args.no_figs,
+        with_bleurt=args.with_bleurt,          # <-- NEW
+        bleurt_ckpt=args.bleurt_checkpoint,    # <-- NEW
     )
