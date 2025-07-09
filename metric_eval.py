@@ -126,6 +126,13 @@ def _ensure_nltk() -> None:
         try:
             nltk.data.find(pkg)
         except LookupError:
+            # a workaround for SSL certificate verifaction failed
+            try:
+                _create_unverified_https_context = ssl._create_unverified_context
+            except AttributeError:
+                pass
+            else:
+                ssl._create_default_https_context = _create_unverified_https_context
             nltk.download(pkg.split("/")[-1], quiet=True)
 
 
